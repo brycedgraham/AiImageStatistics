@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Image Statistics</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f0f0f;
+            color: #e0e0e0;
+            padding: 2rem;
+            max-width: 960px;
+            margin: 0 auto;
+        }
+        h1 { font-size: 1.5rem; margin-bottom: 1.5rem; color: #fff; }
+        h2 { font-size: 1.1rem; margin-bottom: 0.75rem; color: #aaa; }
+
+        /* Summary cards */
+        .summary {
+            display: flex; gap: 1rem; margin-bottom: 2rem;
+        }
+        .card {
+            background: #1a1a1a;
+            border: 1px solid #2a2a2a;
+            border-radius: 8px;
+            padding: 1rem 1.5rem;
+            flex: 1;
+        }
+        .card .label { font-size: 0.8rem; color: #888; text-transform: uppercase; }
+        .card .value { font-size: 1.8rem; font-weight: 700; color: #fff; margin-top: 0.25rem; }
+
+        /* Tables */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 2rem;
+            background: #1a1a1a;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        th, td {
+            padding: 0.6rem 1rem;
+            text-align: left;
+            border-bottom: 1px solid #2a2a2a;
+        }
+        th {
+            background: #222;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            color: #888;
+            letter-spacing: 0.05em;
+        }
+        td { font-size: 0.9rem; }
+        tr:last-child td { border-bottom: none; }
+        tr:hover td { background: #222; }
+        .count { color: #4fc3f7; font-weight: 600; }
+        .weight { color: #81c784; }
+    </style>
+</head>
+<body>
+    <h1>AI Image Statistics</h1>
+
+    <!-- Summary -->
+    <div class="summary">
+        <div class="card">
+            <div class="label">Total Images</div>
+            <div class="value">{{ stats.total_images }}</div>
+        </div>
+        <div class="card">
+            <div class="label">Models</div>
+            <div class="value">{{ stats.total_models }}</div>
+        </div>
+        <div class="card">
+            <div class="label">LoRAs</div>
+            <div class="value">{{ stats.total_loras }}</div>
+        </div>
+    </div>
+
+    <!-- Models table -->
+    <h2>Models by Image Count</h2>
+    <table>
+        <thead>
+            <tr><th>Model</th><th>Images</th></tr>
+        </thead>
+        <tbody>
+            {% for row in models %}
+            <tr>
+                <td>{{ row.name }}</td>
+                <td class="count">{{ row.image_count }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <!-- LoRAs table -->
+    <h2>LoRAs by Usage</h2>
+    <table>
+        <thead>
+            <tr><th>LoRA</th><th>Usage Count</th><th>Avg Weight</th></tr>
+        </thead>
+        <tbody>
+            {% for row in loras %}
+            <tr>
+                <td>{{ row.name }}</td>
+                <td class="count">{{ row.usage_count }}</td>
+                <td class="weight">{{ row.avg_weight }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</body>
+</html>
