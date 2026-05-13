@@ -7,6 +7,7 @@ Output: SQLite database
 """
 
 import argparse
+import hashlib
 import json
 import re
 import sqlite3
@@ -20,6 +21,8 @@ try:
 except ImportError:
     print("Missing dependencies. Install with:\n  pip install Pillow piexif")
     sys.exit(1)
+
+BATCH_SIZE = 100  # images per DB commit
 
 
 # ---------------------------------------------------------------------------
@@ -39,8 +42,9 @@ CREATE TABLE IF NOT EXISTS loras (
 
 CREATE TABLE IF NOT EXISTS images (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    filepath    TEXT NOT NULL UNIQUE,
+    filepath    TEXT NOT NULL,
     filename    TEXT NOT NULL,
+    hash        TEXT NOT NULL UNIQUE,
     width       INTEGER,
     height      INTEGER,
     source_ui   TEXT,           -- 'swarmui' | 'forge' | 'comfyui' | 'unknown'
@@ -63,6 +67,7 @@ CREATE TABLE IF NOT EXISTS image_loras (
 );
 
 CREATE INDEX IF NOT EXISTS idx_images_model   ON images(model_id);
+CREATE INDEX IF NOT EXISTS idx_images_hash    ON images(hash);
 CREATE INDEX IF NOT EXISTS idx_image_loras_im ON image_loras(image_id);
 CREATE INDEX IF NOT EXISTS idx_image_loras_lo ON image_loras(lora_id);
 """
@@ -81,7 +86,6 @@ def get_or_create(conn: sqlite3.Connection, table: str, name: str) -> int:
     if row:
         return row["id"]
     cur = conn.execute(f"INSERT INTO {table} (name) VALUES (?)", (name,))
-    conn.commit()
     return cur.lastrowid
 
 
@@ -290,7 +294,18 @@ def parse_comfyui(info: dict) -> Optional[dict]:
 # Per-image processing
 # ---------------------------------------------------------------------------
 
-def process_image(filepath: Path) -> Optional[dict]:
+def compute_hash(filepath: Path) -> str:
+    """SHA-256 hash of the raw file bytes."""
+    h = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def parse_image(filepath: Path) -> Optional[dict]:
+    """Open image, parse metadata. Does NOT compute hash — caller passes that in."""
+    img = None
     try:
         img = Image.open(filepath)
         info = img.info or {}
@@ -320,6 +335,7 @@ def process_image(filepath: Path) -> Optional[dict]:
 
     meta["rating"] = extract_rating(img, filepath)
     meta["width"], meta["height"] = img.size
+    img.close()
     return meta
 
 
@@ -327,43 +343,56 @@ def process_image(filepath: Path) -> Optional[dict]:
 # DB insertion
 # ---------------------------------------------------------------------------
 
-def insert_image(conn: sqlite3.Connection, filepath: Path, meta: dict, dry_run: bool) -> bool:
+def insert_image(conn: sqlite3.Connection, filepath: Path, meta: dict) -> bool:
+    """Insert a single image into the open transaction. Does NOT commit."""
     path_str = str(filepath.resolve())
+    image_hash = meta.get("hash", "")
 
-    if conn.execute("SELECT id FROM images WHERE filepath = ?", (path_str,)).fetchone():
-        return False  # already indexed
+    if conn.execute("SELECT id FROM images WHERE hash = ?", (image_hash,)).fetchone():
+        return False  # duplicate content already indexed
 
     model_id = None
     if meta.get("model"):
-        model_id = get_or_create(conn, "models", meta["model"]) if not dry_run else -1
+        model_id = get_or_create(conn, "models", meta["model"])
 
-    if not dry_run:
-        cur = conn.execute(
-            """INSERT INTO images
-               (filepath, filename, width, height, source_ui, model_id,
-                prompt, negative, seed, steps, sampler, cfg, rating, raw_meta)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                path_str, filepath.name,
-                meta.get("width"), meta.get("height"),
-                meta.get("source_ui"), model_id,
-                meta.get("prompt"), meta.get("negative"),
-                meta.get("seed"), meta.get("steps"),
-                meta.get("sampler"), meta.get("cfg"),
-                meta.get("rating"), meta.get("raw"),
-            ),
+    cur = conn.execute(
+        """INSERT INTO images
+           (filepath, filename, hash, width, height, source_ui, model_id,
+            prompt, negative, seed, steps, sampler, cfg, rating, raw_meta)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            path_str, filepath.name, image_hash,
+            meta.get("width"), meta.get("height"),
+            meta.get("source_ui"), model_id,
+            meta.get("prompt"), meta.get("negative"),
+            meta.get("seed"), meta.get("steps"),
+            meta.get("sampler"), meta.get("cfg"),
+            meta.get("rating"), meta.get("raw"),
+        ),
+    )
+    image_id = cur.lastrowid
+
+    for lora in meta.get("loras", []):
+        lora_id = get_or_create(conn, "loras", lora["name"])
+        conn.execute(
+            "INSERT OR IGNORE INTO image_loras (image_id, lora_id, weight) VALUES (?,?,?)",
+            (image_id, lora_id, lora.get("weight")),
         )
-        image_id = cur.lastrowid
-
-        for lora in meta.get("loras", []):
-            lora_id = get_or_create(conn, "loras", lora["name"])
-            conn.execute(
-                "INSERT OR IGNORE INTO image_loras (image_id, lora_id, weight) VALUES (?,?,?)",
-                (image_id, lora_id, lora.get("weight")),
-            )
-        conn.commit()
 
     return True
+
+
+def _flush_batch(conn: sqlite3.Connection, batch: list) -> int:
+    """Insert a batch of (filepath, meta) tuples in a single transaction. Returns count of new images."""
+    if not batch:
+        return 0
+    conn.execute("BEGIN")
+    new_count = 0
+    for filepath, meta in batch:
+        if insert_image(conn, filepath, meta):
+            new_count += 1
+    conn.commit()
+    return new_count
 
 
 # ---------------------------------------------------------------------------
@@ -391,19 +420,26 @@ def main():
 
     print(f"Scanning {len(files)} PNG files in {root} ...\n")
 
+    batch = []
     for filepath in files:
         stats["total"] += 1
-        meta = process_image(filepath)
+
+        # Hash first — skip parsing if already indexed
+        image_hash = compute_hash(filepath)
+        if not args.dry_run and conn.execute("SELECT id FROM images WHERE hash = ?", (image_hash,)).fetchone():
+            stats["skipped"] += 1
+            continue
+
+        meta = parse_image(filepath)
         if meta is None:
             stats["skipped"] += 1
             continue
 
+        meta["hash"] = image_hash
         ui = meta.get("source_ui", "unknown")
         stats[ui] = stats.get(ui, 0) + 1
 
-        inserted = insert_image(conn, filepath, meta, dry_run=args.dry_run)
-        if inserted:
-            stats["new"] += 1
+        batch.append((filepath, meta))
 
         if args.verbose or args.dry_run:
             prefix = "[DRY] " if args.dry_run else ""
@@ -414,6 +450,21 @@ def main():
             print(f"  Rating: {meta.get('rating') or '—'}")
             print(f"  Seed:   {meta.get('seed') or '—'}")
             print()
+
+        # Batch commit
+        if len(batch) >= BATCH_SIZE:
+            if args.dry_run:
+                stats["new"] += len(batch)
+            else:
+                stats["new"] += _flush_batch(conn, batch)
+            batch = []
+
+    # Final batch
+    if batch:
+        if args.dry_run:
+            stats["new"] += len(batch)
+        else:
+            stats["new"] += _flush_batch(conn, batch)
 
     # Summary
     print("=" * 50)
