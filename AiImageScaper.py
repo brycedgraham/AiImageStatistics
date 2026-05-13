@@ -172,7 +172,7 @@ FORGE_FOOTER_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-LORA_RE = re.compile(r"<lora:(?P<name>[^:>]+):(?P<weight>[\d.]+)>")
+LORA_RE = re.compile(r"<lora:(?P<name>[^:>]+):(?P<weight>[\d]+(?:\.[\d]+)?)>")
 
 
 def parse_forge(info: dict) -> Optional[dict]:
@@ -189,10 +189,15 @@ def parse_forge(info: dict) -> Optional[dict]:
     negative = neg_parts[0].strip()
     footer = ("Steps:" + neg_parts[1]) if len(neg_parts) > 1 else rest
 
-    loras = [
-        {"name": m.group("name").replace(".safetensors", ""), "weight": float(m.group("weight"))}
-        for m in LORA_RE.finditer(prompt + " " + footer)
-    ]
+    loras = []
+    for m in LORA_RE.finditer(prompt + " " + footer):
+        try:
+            loras.append({
+                "name": m.group("name").replace(".safetensors", ""),
+                "weight": float(m.group("weight")),
+            })
+        except ValueError:
+            pass  # skip malformed weight values
 
     m = FORGE_FOOTER_RE.search(footer)
     model = m.group("model").strip() if m and m.group("model") else ""
